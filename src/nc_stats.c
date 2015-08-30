@@ -21,7 +21,6 @@
 
 #include <sys/types.h>
 #include <sys/socket.h>
-#include <sys/epoll.h>
 #include <netinet/in.h>
 
 #include <nc_core.h>
@@ -362,6 +361,14 @@ stats_create_buf(struct stats *st)
     size += int64_max_digits;
     size += key_value_extra;
 
+    size += st->ntotal_conn_str.len;
+    size += int64_max_digits;
+    size += key_value_extra;
+
+    size += st->ncurr_conn_str.len;
+    size += int64_max_digits;
+    size += key_value_extra;
+
     /* server pools */
     for (i = 0; i < array_n(&st->sum); i++) {
         struct stats_pool *stp = array_get(&st->sum, i);
@@ -505,6 +512,16 @@ stats_add_header(struct stats *st)
     }
 
     status = stats_add_num(st, &st->timestamp_str, cur_ts);
+    if (status != NC_OK) {
+        return status;
+    }
+
+    status = stats_add_num(st, &st->ntotal_conn_str, conn_ntotal_conn());
+    if (status != NC_OK) {
+        return status;
+    }
+
+    status = stats_add_num(st, &st->ncurr_conn_str, conn_ncurr_conn());
     if (status != NC_OK) {
         return status;
     }
@@ -770,34 +787,27 @@ stats_send_rsp(struct stats *st)
     return NC_OK;
 }
 
+static void
+stats_loop_callback(void *arg1, void *arg2)
+{
+    struct stats *st = arg1;
+    int n = *((int *)arg2);
+
+    /* aggregate stats from shadow (b) -> sum (c) */
+    stats_aggregate(st);
+
+    if (n == 0) {
+        return;
+    }
+
+    /* send aggregate stats sum (c) to collector */
+    stats_send_rsp(st);
+}
+
 static void *
 stats_loop(void *arg)
 {
-    struct stats *st = arg;
-    int n;
-
-    for (;;) {
-        n = epoll_wait(st->ep, &st->event, 1, st->interval);
-        if (n < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            log_error("epoll wait on e %d with event m %d failed: %s",
-                      st->ep, st->sd, strerror(errno));
-            break;
-        }
-
-        /* aggregate stats from shadow (b) -> sum (c) */
-        stats_aggregate(st);
-
-        if (n == 0) {
-            continue;
-        }
-
-        /* send aggregate stats sum (c) to collector */
-        stats_send_rsp(st);
-    }
-
+    event_loop_stats(stats_loop_callback, arg);
     return NULL;
 }
 
@@ -847,7 +857,6 @@ static rstatus_t
 stats_start_aggregator(struct stats *st)
 {
     rstatus_t status;
-    struct epoll_event ev;
 
     if (!stats_enabled) {
         return NC_OK;
@@ -856,22 +865,6 @@ stats_start_aggregator(struct stats *st)
     status = stats_listen(st);
     if (status != NC_OK) {
         return status;
-    }
-
-    st->ep = epoll_create(10);
-    if (st->ep < 0) {
-        log_error("epoll create failed: %s", strerror(errno));
-        return NC_ERROR;
-    }
-
-    ev.data.fd = st->sd;
-    ev.events = EPOLLIN;
-
-    status = epoll_ctl(st->ep, EPOLL_CTL_ADD, st->sd, &ev);
-    if (status < 0) {
-        log_error("epoll ctl on e %d sd %d failed: %s", st->ep, st->sd,
-                  strerror(errno));
-        return NC_ERROR;
     }
 
     status = pthread_create(&st->tid, NULL, stats_loop, st);
@@ -891,7 +884,6 @@ stats_stop_aggregator(struct stats *st)
     }
 
     close(st->sd);
-    close(st->ep);
 }
 
 struct stats *
@@ -921,7 +913,6 @@ stats_create(uint16_t stats_port, char *stats_ip, int stats_interval,
     array_null(&st->sum);
 
     st->tid = (pthread_t) -1;
-    st->ep = -1;
     st->sd = -1;
 
     string_set_text(&st->service_str, "service");
@@ -935,6 +926,9 @@ stats_create(uint16_t stats_port, char *stats_ip, int stats_interval,
 
     string_set_text(&st->uptime_str, "uptime");
     string_set_text(&st->timestamp_str, "timestamp");
+
+    string_set_text(&st->ntotal_conn_str, "total_connections");
+    string_set_text(&st->ncurr_conn_str, "curr_connections");
 
     st->updated = 0;
     st->aggregate = 0;
@@ -1101,6 +1095,21 @@ _stats_pool_decr_by(struct context *ctx, struct server_pool *pool,
               stm->name.data, stm->value.counter);
 }
 
+void
+_stats_pool_set_ts(struct context *ctx, struct server_pool *pool,
+                   stats_pool_field_t fidx, int64_t val)
+{
+    struct stats_metric *stm;
+
+    stm = stats_pool_to_metric(ctx, pool, fidx);
+
+    ASSERT(stm->type == STATS_TIMESTAMP);
+    stm->value.timestamp = val;
+
+    log_debug(LOG_VVVERB, "set ts field '%.*s' to %"PRId64"", stm->name.len,
+              stm->name.data, stm->value.timestamp);
+}
+
 static struct stats_metric *
 stats_server_to_metric(struct context *ctx, struct server *server,
                        stats_server_field_t fidx)
@@ -1185,4 +1194,19 @@ _stats_server_decr_by(struct context *ctx, struct server *server,
 
     log_debug(LOG_VVVERB, "decr by field '%.*s' to %"PRId64"", stm->name.len,
               stm->name.data, stm->value.counter);
+}
+
+void
+_stats_server_set_ts(struct context *ctx, struct server *server,
+                     stats_server_field_t fidx, int64_t val)
+{
+    struct stats_metric *stm;
+
+    stm = stats_server_to_metric(ctx, server, fidx);
+
+    ASSERT(stm->type == STATS_TIMESTAMP);
+    stm->value.timestamp = val;
+
+    log_debug(LOG_VVVERB, "set ts field '%.*s' to %"PRId64"", stm->name.len,
+              stm->name.data, stm->value.timestamp);
 }

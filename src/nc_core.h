@@ -40,14 +40,31 @@
 # define NC_STATS 0
 #endif
 
+#ifdef HAVE_EPOLL
+# define NC_HAVE_EPOLL 1
+#elif HAVE_KQUEUE
+# define NC_HAVE_KQUEUE 1
+#elif HAVE_EVENT_PORTS
+# define NC_HAVE_EVENT_PORTS 1
+#else
+# error missing scalable I/O event notification mechanism
+#endif
+
 #ifdef HAVE_LITTLE_ENDIAN
 # define NC_LITTLE_ENDIAN 1
+#endif
+
+#ifdef HAVE_BACKTRACE
+# define NC_HAVE_BACKTRACE 1
 #endif
 
 #define NC_OK        0
 #define NC_ERROR    -1
 #define NC_EAGAIN   -2
 #define NC_ENOMEM   -3
+
+/* reserved fds for std streams, log, stats fd, epoll etc. */
+#define RESERVED_FDS 32
 
 typedef int rstatus_t; /* return type */
 typedef int err_t;     /* error type */
@@ -65,14 +82,16 @@ struct mbuf;
 struct mhdr;
 struct conf;
 struct stats;
-struct epoll_event;
 struct instance;
+struct event_base;
 
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <inttypes.h>
 #include <string.h>
+#include <stdio.h>
+#include <ctype.h>
 #include <errno.h>
 #include <limits.h>
 #include <time.h>
@@ -82,6 +101,8 @@ struct instance;
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/time.h>
+#include <sys/resource.h>
 #include <netinet/in.h>
 
 #include <nc_array.h>
@@ -90,10 +111,12 @@ struct instance;
 #include <nc_rbtree.h>
 #include <nc_log.h>
 #include <nc_util.h>
+#include <event/nc_event.h>
 #include <nc_stats.h>
 #include <nc_mbuf.h>
 #include <nc_message.h>
 #include <nc_connection.h>
+#include <nc_server.h>
 
 struct context {
     uint32_t           id;          /* unique context id */
@@ -101,13 +124,15 @@ struct context {
     struct stats       *stats;      /* stats */
 
     struct array       pool;        /* server_pool[] */
+    struct event_base  *evb;        /* event base */
+    int                max_timeout; /* max timeout in msec */
+    int                timeout;     /* timeout in msec */
 
-    int                ep;          /* epoll device */
-    int                nevent;      /* # epoll event */
-    int                max_timeout; /* epoll wait max timeout in msec */
-    int                timeout;     /* epoll wait timeout in msec */
-    struct epoll_event *event;      /* epoll event */
+    uint32_t           max_nfd;     /* max # files */
+    uint32_t           max_ncconn;  /* max # client connections */
+    uint32_t           max_nsconn;  /* max # server connections */
 };
+
 
 struct instance {
     struct context  *ctx;                        /* active context */
@@ -126,6 +151,7 @@ struct instance {
 
 struct context *core_start(struct instance *nci);
 void core_stop(struct context *ctx);
+rstatus_t core_core(void *arg, uint32_t events);
 rstatus_t core_loop(struct context *ctx);
 
 #endif

@@ -22,6 +22,7 @@
 #include <getopt.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/utsname.h>
 
 #include <nc_core.h>
 #include <nc_conf.h>
@@ -174,7 +175,17 @@ nc_daemonize(int dump_core)
 static void
 nc_print_run(struct instance *nci)
 {
-    loga("nutcracker-%s started on pid %d", NC_VERSION_STRING, nci->pid);
+    int status;
+    struct utsname name;
+
+    status = uname(&name);
+    if (status < 0) {
+        loga("nutcracker-%s started on pid %d", NC_VERSION_STRING, nci->pid);
+    } else {
+        loga("nutcracker-%s built for %s %s %s started on pid %d",
+             NC_VERSION_STRING, name.sysname, name.release, name.machine,
+             nci->pid);
+    }
 
     loga("run, rabbit run / dig that hole, forget the sun / "
          "and when at last the work is done / don't sit down / "
@@ -203,7 +214,7 @@ nc_show_usage(void)
         "  -d, --daemonize        : run as a daemon" CRLF
         "  -D, --describe-stats   : print stats description and exit");
     log_stderr(
-        "  -v, --verbosity=N      : set logging level (default: %d, min: %d, max: %d)" CRLF
+        "  -v, --verbose=N        : set logging level (default: %d, min: %d, max: %d)" CRLF
         "  -o, --output=S         : set logging file (default: %s)" CRLF
         "  -c, --conf-file=S      : set configuration file (default: %s)" CRLF
         "  -s, --stats-port=N     : set stats monitoring port (default: %d)" CRLF

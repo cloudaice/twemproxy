@@ -85,6 +85,7 @@ int nc_set_tcpnodelay(int sd);
 int nc_set_linger(int sd, int timeout);
 int nc_set_sndbuf(int sd, int size);
 int nc_set_rcvbuf(int sd, int size);
+int nc_set_tcpkeepalive(int sd);
 int nc_get_soerror(int sd);
 int nc_get_sndbuf(int sd);
 int nc_get_rcvbuf(int sd);
@@ -185,6 +186,7 @@ ssize_t _nc_recvn(int sd, void *vptr, size_t n);
 
 void nc_assert(const char *cond, const char *file, int line, int panic);
 void nc_stacktrace(int skip_count);
+void nc_stacktrace_fd(int fd);
 
 int _scnprintf(char *buf, size_t size, const char *fmt, ...);
 int _vscnprintf(char *buf, size_t size, const char *fmt, va_list args);

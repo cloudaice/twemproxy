@@ -1,11 +1,18 @@
 MAINTAINERCLEANFILES = Makefile.in
 
-AM_CPPFLAGS = -D_GNU_SOURCE -D_XOPEN_SOURCE
+AM_CPPFLAGS =
+if !OS_SOLARIS
+AM_CPPFLAGS += -D_GNU_SOURCE
+endif
 AM_CPPFLAGS += -I $(top_srcdir)/src/hashkit
 AM_CPPFLAGS += -I $(top_srcdir)/src/proto
+AM_CPPFLAGS += -I $(top_srcdir)/src/event
 AM_CPPFLAGS += -I $(top_srcdir)/contrib/yaml-0.1.4/include
 
-AM_CFLAGS = -Wall -Wshadow
+AM_CFLAGS = 
+# about -fno-strict-aliasing: https://github.com/twitter/twemproxy/issues/276
+AM_CFLAGS += -fno-strict-aliasing
+AM_CFLAGS += -Wall -Wshadow
 AM_CFLAGS += -Wpointer-arith
 AM_CFLAGS += -Winline
 AM_CFLAGS += -Wunused-function -Wunused-variable -Wunused-value
@@ -13,11 +20,18 @@ AM_CFLAGS += -Wno-unused-parameter -Wno-unused-value
 AM_CFLAGS += -Wconversion -Wsign-compare
 AM_CFLAGS += -Wstrict-prototypes -Wmissing-prototypes -Wredundant-decls -Wmissing-declarations
 
-AM_LDFLAGS = -lm -lpthread -rdynamic
+AM_LDFLAGS =
+AM_LDFLAGS += -lm -lpthread -rdynamic
+if OS_SOLARIS
+AM_LDFLAGS += -lnsl -lsocket
+endif
+if OS_FREEBSD
+AM_LDFLAGS += -lexecinfo
+endif
 
-SUBDIRS = hashkit proto
+SUBDIRS = hashkit proto event
 
-bin_PROGRAMS = nutcracker
+sbin_PROGRAMS = nutcracker
 
 nutcracker_SOURCES =			\
 	nc_core.c nc_core.h		\
@@ -29,7 +43,6 @@ nutcracker_SOURCES =			\
 	nc_request.c			\
 	nc_response.c			\
 	nc_mbuf.c nc_mbuf.h		\
-	nc_event.c nc_event.h		\
 	nc_conf.c nc_conf.h		\
 	nc_stats.c nc_stats.h		\
 	nc_signal.c nc_signal.h		\
@@ -43,4 +56,5 @@ nutcracker_SOURCES =			\
 
 nutcracker_LDADD = $(top_builddir)/src/hashkit/libhashkit.a
 nutcracker_LDADD += $(top_builddir)/src/proto/libproto.a
+nutcracker_LDADD += $(top_builddir)/src/event/libevent.a
 nutcracker_LDADD += $(top_builddir)/contrib/yaml-0.1.4/src/.libs/libyaml.a

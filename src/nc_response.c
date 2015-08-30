@@ -17,7 +17,6 @@
 
 #include <nc_core.h>
 #include <nc_server.h>
-#include <nc_event.h>
 
 struct msg *
 rsp_get(struct conn *conn)
@@ -90,7 +89,6 @@ rsp_recv_next(struct context *ctx, struct conn *conn, bool alloc)
     struct msg *msg;
 
     ASSERT(!conn->client && !conn->proxy);
-    ASSERT(!conn->connecting);
 
     if (conn->eof) {
         msg = conn->rmsg;
@@ -157,17 +155,57 @@ rsp_filter(struct context *ctx, struct conn *conn, struct msg *msg)
 
     pmsg = TAILQ_FIRST(&conn->omsg_q);
     if (pmsg == NULL) {
-        log_error("filter stray rsp %"PRIu64" len %"PRIu32" on s %d", msg->id,
-                  msg->mlen, conn->sd);
+        log_debug(LOG_ERR, "filter stray rsp %"PRIu64" len %"PRIu32" on s %d",
+                  msg->id, msg->mlen, conn->sd);
         rsp_put(msg);
-        errno = EINVAL;
-        conn->err = errno;
+
+        /*
+         * Memcached server can respond with an error response before it has
+         * received the entire request. This is most commonly seen for set
+         * requests that exceed item_size_max. IMO, this behavior of memcached
+         * is incorrect. The right behavior for update requests that are over
+         * item_size_max would be to either:
+         * - close the connection Or,
+         * - read the entire item_size_max data and then send CLIENT_ERROR
+         *
+         * We handle this stray packet scenario in nutcracker by closing the
+         * server connection which would end up sending SERVER_ERROR to all
+         * clients that have requests pending on this server connection. The
+         * fix is aggressive, but not doing so would lead to clients getting
+         * out of sync with the server and as a result clients end up getting
+         * responses that don't correspond to the right request.
+         *
+         * See: https://github.com/twitter/twemproxy/issues/149
+         */
+        conn->err = EINVAL;
+        conn->done = 1;
         return true;
     }
     ASSERT(pmsg->peer == NULL);
     ASSERT(pmsg->request && !pmsg->done);
 
+    /*
+     * If the response from a server suggests a protocol level transient
+     * failure, close the server connection and send back a generic error
+     * response to the client.
+     *
+     * If auto_eject_host is enabled, this will also update the failure_count
+     * and eject the server if it exceeds the failure_limit
+     */
+    if (msg->failure(msg)) {
+        log_debug(LOG_INFO, "server failure rsp %"PRIu64" len %"PRIu32" "
+                  "type %d on s %d", msg->id, msg->mlen, msg->type, conn->sd);
+        rsp_put(msg);
+
+        conn->err = EINVAL;
+        conn->done = 1;
+
+        return true;
+    }
+
     if (pmsg->swallow) {
+        conn->swallow_msg(conn, pmsg, msg);
+
         conn->dequeue_outq(ctx, conn, pmsg);
         pmsg->done = 1;
 
@@ -184,12 +222,12 @@ rsp_filter(struct context *ctx, struct conn *conn, struct msg *msg)
 }
 
 static void
-rsp_forward_stats(struct context *ctx, struct server *server, struct msg *msg)
+rsp_forward_stats(struct context *ctx, struct server *server, struct msg *msg, uint32_t msgsize)
 {
     ASSERT(!msg->request);
 
     stats_server_incr(ctx, server, responses);
-    stats_server_incr_by(ctx, server, response_bytes, msg->mlen);
+    stats_server_incr_by(ctx, server, response_bytes, msgsize);
 }
 
 static void
@@ -198,8 +236,10 @@ rsp_forward(struct context *ctx, struct conn *s_conn, struct msg *msg)
     rstatus_t status;
     struct msg *pmsg;
     struct conn *c_conn;
+    uint32_t msgsize;
 
     ASSERT(!s_conn->client && !s_conn->proxy);
+    msgsize = msg->mlen;
 
     /* response from server implies that server is ok and heartbeating */
     server_ok(ctx, s_conn);
@@ -222,13 +262,13 @@ rsp_forward(struct context *ctx, struct conn *s_conn, struct msg *msg)
     ASSERT(c_conn->client && !c_conn->proxy);
 
     if (req_done(c_conn, TAILQ_FIRST(&c_conn->omsg_q))) {
-        status = event_add_out(ctx->ep, c_conn);
+        status = event_add_out(ctx->evb, c_conn);
         if (status != NC_OK) {
             c_conn->err = errno;
         }
     }
 
-    rsp_forward_stats(ctx, s_conn->owner, msg);
+    rsp_forward_stats(ctx, s_conn->owner, msg, msgsize);
 }
 
 void
@@ -267,7 +307,7 @@ rsp_send_next(struct context *ctx, struct conn *conn)
             log_debug(LOG_INFO, "c %d is done", conn->sd);
         }
 
-        status = event_del_out(ctx->ep, conn);
+        status = event_del_out(ctx->evb, conn);
         if (status != NC_OK) {
             conn->err = errno;
         }

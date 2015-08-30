@@ -79,11 +79,31 @@
  * out_q ensures that we always send back the response of request at the head
  * of the queue, before sending out responses of other completed requests in
  * the queue.
- *
  */
 
 static uint32_t nfree_connq;       /* # free conn q */
 static struct conn_tqh free_connq; /* free conn q */
+static uint64_t ntotal_conn;       /* total # connections counter from start */
+static uint32_t ncurr_conn;        /* current # connections */
+static uint32_t ncurr_cconn;       /* current # client connections */
+
+/*
+ * Return the context associated with this connection.
+ */
+struct context *
+conn_to_ctx(struct conn *conn)
+{
+    struct server_pool *pool;
+
+    if (conn->proxy || conn->client) {
+        pool = conn->owner;
+    } else {
+        struct server *server = conn->owner;
+        pool = server->owner;
+    }
+
+    return pool->ctx;
+}
 
 static struct conn *
 _conn_get(void)
@@ -136,6 +156,10 @@ _conn_get(void)
     conn->eof = 0;
     conn->done = 0;
     conn->redis = 0;
+    conn->authenticated = 0;
+
+    ntotal_conn++;
+    ncurr_conn++;
 
     return conn;
 }
@@ -178,6 +202,10 @@ conn_get(void *owner, bool client, bool redis)
         conn->dequeue_inq = NULL;
         conn->enqueue_outq = req_client_enqueue_omsgq;
         conn->dequeue_outq = req_client_dequeue_omsgq;
+        conn->post_connect = NULL;
+        conn->swallow_msg = NULL;
+
+        ncurr_cconn++;
     } else {
         /*
          * server receives a response, possibly parsing it, and sends a
@@ -201,10 +229,16 @@ conn_get(void *owner, bool client, bool redis)
         conn->dequeue_inq = req_server_dequeue_imsgq;
         conn->enqueue_outq = req_server_enqueue_omsgq;
         conn->dequeue_outq = req_server_dequeue_omsgq;
+        if (redis) {
+          conn->post_connect = redis_post_connect;
+          conn->swallow_msg = redis_swallow_msg;
+        } else {
+          conn->post_connect = memcache_post_connect;
+          conn->swallow_msg = memcache_swallow_msg;
+        }
     }
 
     conn->ref(conn, owner);
-
     log_debug(LOG_VVERB, "get conn %p client %d", conn, conn->client);
 
     return conn;
@@ -268,6 +302,11 @@ conn_put(struct conn *conn)
 
     nfree_connq++;
     TAILQ_INSERT_HEAD(&free_connq, conn, conn_tqe);
+
+    if (conn->client) {
+        ncurr_cconn--;
+    }
+    ncurr_conn--;
 }
 
 void
@@ -389,4 +428,46 @@ conn_sendv(struct conn *conn, struct array *sendv, size_t nsend)
     NOT_REACHED();
 
     return NC_ERROR;
+}
+
+uint32_t
+conn_ncurr_conn(void)
+{
+    return ncurr_conn;
+}
+
+uint64_t
+conn_ntotal_conn(void)
+{
+    return ntotal_conn;
+}
+
+uint32_t
+conn_ncurr_cconn(void)
+{
+    return ncurr_cconn;
+}
+
+/*
+ * Returns true if the connection is authenticated or doesn't require
+ * authentication, otherwise return false
+ */
+bool
+conn_authenticated(struct conn *conn)
+{
+    struct server_pool *pool;
+
+    ASSERT(!conn->proxy);
+
+    pool = conn->client ? conn->owner : ((struct server *)conn->owner)->owner;
+
+    if (!pool->require_auth) {
+        return true;
+    }
+
+    if (!conn->authenticated) {
+        return false;
+    }
+
+    return true;
 }

@@ -2,7 +2,7 @@ If you are deploying nutcracker in your production environment, here are a few r
 
 ## Log Level
 
-By default debug logging is disabled in nutcracker. However, it is worthwhile running nutcracker with debug logging enabled and verbosity level set to LOG_INFO (-v 6 or --verbosity=6). This in reality does not add much overhead as you only pay the cost of checking an if condition for every log line encountered during the run time.
+By default debug logging is disabled in nutcracker. However, it is worthwhile running nutcracker with debug logging enabled and verbosity level set to LOG_INFO (-v 6 or --verbose=6). This in reality does not add much overhead as you only pay the cost of checking an if condition for every log line encountered during the run time.
 
 At LOG_INFO level, nutcracker logs the life cycle of every client and server connection and important events like the server being ejected from the hash ring and so on. Eg.
 
@@ -50,7 +50,7 @@ It is always a good idea to configure nutcracker `timeout:` for every server poo
 
 Relying only on client-side timeouts has the adverse effect of the original request having timedout on the client to proxy connection, but still pending and outstanding on the proxy to server connection. This further gets exacerbated when client retries the original request.
 
-By default, nutcracker waits indefinitely for any request sent to the server. However, when `timeout:` key is configured, a requests for which no response is received from the server in `timeout:` msec is timedout and an error response `SERVER_ERROR Connection timed out\r\n` is sent back to the client.
+By default, nutcracker waits indefinitely for any request sent to the server. However, when `timeout:` key is configured, a requests for which no response is received from the server in `timeout:` msec is timedout and an error response `SERVER_ERROR Connection timed out\r\n` (memcached) or `-ERR Connection timed out\r\n` (redis) is sent back to the client.
 
 ## Error Response
 
@@ -69,9 +69,21 @@ Seeing a `SERVER_ERROR` or `-ERR` response should be considered as a transient f
 
 ## read, writev and mbuf
 
-All memory for incoming requests and outgoing responses is allocated in mbuf. Mbuf enables zero copy for requests and responses flowing through the proxy. By default an mbuf is 16K bytes in size and this value can be tuned between 512 and 65K bytes using -m or --mbuf-size=N argument. Every connection has at least one mbuf allocated to it. This means that the number of concurrent connections nutcracker can support is dependent on the mbuf size. A small mbuf allows us to handle more connections, while a large mbuf allows us to read and write more data to and from kernel socket buffers.
+All memory for incoming requests and outgoing responses is allocated in mbuf. Mbuf enables zero copy for requests and responses flowing through the proxy. By default an mbuf is 16K bytes in size and this value can be tuned between 512 and 16M bytes using -m or --mbuf-size=N argument. Every connection has at least one mbuf allocated to it. This means that the number of concurrent connections nutcracker can support is dependent on the mbuf size. A small mbuf allows us to handle more connections, while a large mbuf allows us to read and write more data to and from kernel socket buffers.
 
 If nutcracker is meant to handle a large number of concurrent client connections, you should set the mbuf size to 512 or 1K bytes.
+
+## How to interpret mbuf-size=N argument?
+
+Every client connection consumes at least one mbuf. To service a request we need two connections (one from client to proxy and another from proxy to server). So we would need two mbufs.
+
+A fragmentable request like 'get foo bar\r\n', which btw gets fragmented to 'get foo\r\n' and 'get bar\r\n' would consume two mbuf for request and two mbuf for response. So a fragmentable request with N fragments needs N * 2 mbufs. The good thing about mbuf is that the memory comes from a reuse pool. Once a mbuf is allocated, it is never freed but just put back into the reuse pool. The bad thing is that once mbuf is allocated it is never freed, since a freed mbuf always goes back to the [reuse pool](https://github.com/twitter/twemproxy/blob/master/src/nc_mbuf.c#L23-L24). This can however be easily fixed if needed by putting a threshold parameter on the reuse pool.
+
+So, if nutcracker is handling say 1K client connections and 100 server connections, it would consume (max(1000, 100) * 2 * mbuf-size) memory for mbuf. If we assume that clients are sending non-pipelined request, then with default mbuf-size of 16K this would in total consume 32M.
+
+Furthermore, if on average every requests has 10 fragments, then the memory consumption would be 320M. Instead of handling 1K client connections, lets say you were handling 10K, then the memory consumption would be 3.2G. Now instead of using a default mbuf-size of 16K, you used 512 bytes, then memory consumption for the same scenario would drop to 1000 * 2 * 512 * 10 = 10M
+
+This is the reason why for 'large number' of connections or for wide multi-get like requests, you want to choose a small value for mbuf-size like 512
 
 ## Maximum Key Length
 The memcache ascii protocol [specification](notes/memcache.txt) limits the maximum length of the key to 250 characters. The key should not include whitespace, or '\r' or '\n' character. For redis, we have no such limitation. However, nutcracker requires the key to be stored in a contiguous memory region. Since all requests and responses in nutcracker are stored in mbuf, the maximum length of the redis key is limited by the size of the maximum available space for data in mbuf (mbuf_data_size()). This means that if you want your redis instances to handle large keys, you might want to choose large mbuf size set using -m or --mbuf-size=N command-line argument.
@@ -103,7 +115,7 @@ Note that when using node names for consistent hashing, twemproxy ignores the we
 
 [Hash Tags](http://antirez.com/post/redis-presharding.html) enables you to use part of the key for calculating the hash. When the hash tag is present, we use part of the key within the tag as the key to be used for consistent hashing. Otherwise, we use the full key as is. Hash tags enable you to map different keys to the same server as long as the part of the key within the tag is the same.
 
-For example, the configuration of server pool _beta_, aslo shown below, specifies a two character hash_tag string - "{}". This means that keys "user:{user1}:ids" and "user:{user1}:tweets" map to the same server because we compute the hash on "user1". For a key like "user:user1:ids", we use the entire string "user:user1:ids" to compute the hash and it may map to a different server.
+For example, the configuration of server pool _beta_, also shown below, specifies a two character hash_tag string - "{}". This means that keys "user:{user1}:ids" and "user:{user1}:tweets" map to the same server because we compute the hash on "user1". For a key like "user:user1:ids", we use the entire string "user:user1:ids" to compute the hash and it may map to a different server.
 
     beta:
       listen: 127.0.0.1:22122
@@ -118,8 +130,7 @@ For example, the configuration of server pool _beta_, aslo shown below, specifie
        - 127.0.0.1:6381:1 server2
        - 127.0.0.1:6382:1 server3
        - 127.0.0.1:6383:1 server4
-       
-       
+
 ## Graphing Cache-pool State
 
 When running nutcracker in production, you often would like to know the list of live and ejected servers at any given time. You can easily answer this question, by generating a time series graph of live and/or dead servers that are part of any cache pool. To do this your graphing client must collect the following stats exposed by nutcracker:
@@ -135,3 +146,17 @@ So, on a given server, the cumulative number of times a server is ejected can be
 ```
 
 A diff of the above value between two successive time intervals would generate a nice timeseries graph for ejected servers.
+
+You can also graph the timestamp at which any given server was ejected by graphing `server_ejected_at` stat.
+
+## server_connections: > 1
+
+By design, twemproxy multiplexes several client connections over few server connections. It is important to note that **"read my last write"** constraint doesn't necessarily hold true when twemproxy is configured with `server_connections: > 1`. 
+
+To illustrate this, consider a scenario where twemproxy is configured with `server_connections: 2`. If a client makes pipelined requests with the first request in pipeline being `set foo 0 0 3\r\nbar\r\n` (write) and the second request being `get foo\r\n` (read), the expectation is that the read of key `foo` would return the value `bar`. However, with configuration of two server connections it is possible that write and read request are sent on different server connections which would mean that their completion could race with one another. In summary, if the client expects "read my last write" constraint, you either configure twemproxy to use `server_connections:1` or use clients that only make synchronous requests to twemproxy.
+
+## twemproxy and python-memcached
+
+The implementation of delete command in [python-memcached](https://github.com/linsomniac/python-memcached) conflicts with the one in twemproxy. See [issue 283](https://github.com/twitter/twemproxy/pull/283) for details. The workaround for this issue is to call `delete_multi` in python-memcached as follows:
+
+        mc.delete_multi([key1, key2, ... keyN], time=None)

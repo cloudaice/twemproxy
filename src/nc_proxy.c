@@ -15,11 +15,11 @@
  * limitations under the License.
  */
 
+#include <sys/stat.h>
 #include <sys/un.h>
 
 #include <nc_core.h>
 #include <nc_server.h>
-#include <nc_event.h>
 #include <nc_proxy.h>
 
 void
@@ -30,9 +30,9 @@ proxy_ref(struct conn *conn, void *owner)
     ASSERT(!conn->client && conn->proxy);
     ASSERT(conn->owner == NULL);
 
-    conn->family = pool->family;
-    conn->addrlen = pool->addrlen;
-    conn->addr = pool->addr;
+    conn->family = pool->info.family;
+    conn->addrlen = pool->info.addrlen;
+    conn->addr = (struct sockaddr *)&pool->info.addr;
 
     pool->p_conn = conn;
 
@@ -149,6 +149,16 @@ proxy_listen(struct context *ctx, struct conn *p)
         return NC_ERROR;
     }
 
+    if (p->family == AF_UNIX && pool->perm) {
+        struct sockaddr_un *un = (struct sockaddr_un *)p->addr;
+        status = chmod(un->sun_path, pool->perm);
+        if (status < 0) {
+            log_error("chmod on p %d on addr '%.*s' failed: %s", p->sd,
+                      pool->addrstr.len, pool->addrstr.data, strerror(errno));
+            return NC_ERROR;
+        }
+    }
+
     status = listen(p->sd, pool->backlog);
     if (status < 0) {
         log_error("listen on p %d on addr '%.*s' failed: %s", p->sd,
@@ -163,18 +173,18 @@ proxy_listen(struct context *ctx, struct conn *p)
         return NC_ERROR;
     }
 
-    status = event_add_conn(ctx->ep, p);
+    status = event_add_conn(ctx->evb, p);
     if (status < 0) {
-        log_error("event add conn e %d p %d on addr '%.*s' failed: %s",
-                  ctx->ep, p->sd, pool->addrstr.len, pool->addrstr.data,
+        log_error("event add conn p %d on addr '%.*s' failed: %s",
+                  p->sd, pool->addrstr.len, pool->addrstr.data,
                   strerror(errno));
         return NC_ERROR;
     }
 
-    status = event_del_out(ctx->ep, p);
+    status = event_del_out(ctx->evb, p);
     if (status < 0) {
-        log_error("event del out e %d p %d on addr '%.*s' failed: %s",
-                  ctx->ep, p->sd, pool->addrstr.len, pool->addrstr.data,
+        log_error("event del out p %d on addr '%.*s' failed: %s",
+                  p->sd, pool->addrstr.len, pool->addrstr.data,
                   strerror(errno));
         return NC_ERROR;
     }
@@ -264,6 +274,7 @@ proxy_accept(struct context *ctx, struct conn *p)
     rstatus_t status;
     struct conn *c;
     int sd;
+    struct server_pool *pool = p->owner;
 
     ASSERT(p->proxy && !p->client);
     ASSERT(p->sd > 0);
@@ -277,22 +288,52 @@ proxy_accept(struct context *ctx, struct conn *p)
                 continue;
             }
 
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ECONNABORTED) {
                 log_debug(LOG_VERB, "accept on p %d not ready - eagain", p->sd);
                 p->recv_ready = 0;
                 return NC_OK;
             }
 
-            /*
-             * FIXME: On EMFILE or ENFILE mask out IN event on the proxy; mask
-             * it back in when some existing connection gets closed
+            /* 
+             * Workaround of https://github.com/twitter/twemproxy/issues/97
+             *
+             * We should never reach here because the check for conn_ncurr_cconn()
+             * against ctx->max_ncconn should catch this earlier in the cycle.
+             * If we reach here ignore EMFILE/ENFILE, return NC_OK will enable
+             * the server continue to run instead of close the server socket
+             *
+             * The right solution however, is on EMFILE/ENFILE to mask out IN
+             * event on the proxy and mask it back in when some existing
+             * connections gets closed
              */
+            if (errno == EMFILE || errno == ENFILE) {
+                log_debug(LOG_CRIT, "accept on p %d with max fds %"PRIu32" "
+                          "used connections %"PRIu32" max client connections %"PRIu32" "
+                          "curr client connections %"PRIu32" failed: %s",
+                          p->sd, ctx->max_nfd, conn_ncurr_conn(),
+                          ctx->max_ncconn, conn_ncurr_cconn(), strerror(errno));
+
+                p->recv_ready = 0;
+
+                return NC_OK;
+            }
 
             log_error("accept on p %d failed: %s", p->sd, strerror(errno));
+
             return NC_ERROR;
         }
 
         break;
+    }
+
+    if (conn_ncurr_cconn() >= ctx->max_ncconn) {
+        log_debug(LOG_CRIT, "client connections %"PRIu32" exceed limit %"PRIu32,
+                  conn_ncurr_cconn(), ctx->max_ncconn);
+        status = close(sd);
+        if (status < 0) {
+            log_error("close c %d failed, ignored: %s", sd, strerror(errno));
+        }
+        return NC_OK;
     }
 
     c = conn_get(p->owner, true, p->redis);
@@ -317,6 +358,14 @@ proxy_accept(struct context *ctx, struct conn *p)
         return status;
     }
 
+    if (pool->tcpkeepalive) {
+        status = nc_set_tcpkeepalive(c->sd);
+        if (status < 0) {
+            log_warn("set tcpkeepalive on c %d from p %d failed, ignored: %s",
+                     c->sd, p->sd, strerror(errno));
+        }
+    }
+
     if (p->family == AF_INET || p->family == AF_INET6) {
         status = nc_set_tcpnodelay(c->sd);
         if (status < 0) {
@@ -325,9 +374,9 @@ proxy_accept(struct context *ctx, struct conn *p)
         }
     }
 
-    status = event_add_conn(ctx->ep, c);
+    status = event_add_conn(ctx->evb, c);
     if (status < 0) {
-        log_error("event add conn of c %d from p %d failed: %s", c->sd, p->sd,
+        log_error("event add conn from p %d failed: %s", p->sd,
                   strerror(errno));
         c->close(ctx, c);
         return status;

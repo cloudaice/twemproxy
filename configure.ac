@@ -1,8 +1,8 @@
 # Define the package version numbers and the bug reporting address
 m4_define([NC_MAJOR], 0)
-m4_define([NC_MINOR], 2)
-m4_define([NC_PATCH], 4)
-m4_define([NC_BUGS], [manj@twitter.com])
+m4_define([NC_MINOR], 4)
+m4_define([NC_PATCH], 1)
+m4_define([NC_BUGS], [manj@cs.stanford.edu])
 
 # Initialize autoconf
 AC_PREREQ([2.64])
@@ -67,7 +67,10 @@ AC_CHECK_HEADERS([fcntl.h float.h limits.h stddef.h stdlib.h string.h unistd.h])
 AC_CHECK_HEADERS([inttypes.h stdint.h])
 AC_CHECK_HEADERS([sys/ioctl.h sys/time.h sys/uio.h])
 AC_CHECK_HEADERS([sys/socket.h sys/un.h netinet/in.h arpa/inet.h netdb.h])
-AC_CHECK_HEADERS([sys/epoll.h], [], [AC_MSG_ERROR([required sys/epoll.h header file is missing])])
+AC_CHECK_HEADERS([execinfo.h],
+  [AC_DEFINE(HAVE_BACKTRACE, [1], [Define to 1 if backtrace is supported])], [])
+AC_CHECK_HEADERS([sys/epoll.h], [], [])
+AC_CHECK_HEADERS([sys/event.h], [], [])
 
 # Checks for libraries
 AC_CHECK_LIB([m], [pow])
@@ -100,7 +103,62 @@ main(int argc, char **argv)
     exit(0);
 }
   ], [ac_cv_epoll_works=yes], [ac_cv_epoll_works=no]))
-AS_IF([test "x$ac_cv_epoll_works" = "xyes"], [], [AC_MSG_FAILURE([Linux epoll(7) API is missing])])
+AS_IF([test "x$ac_cv_epoll_works" = "xyes"],
+  [AC_DEFINE([HAVE_EPOLL], [1], [Define to 1 if epoll is supported])], [])
+
+AC_CACHE_CHECK([if kqueue works], [ac_cv_kqueue_works],
+  AC_TRY_RUN([
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/types.h>
+#include <sys/event.h>
+#include <sys/time.h>
+int
+main(int argc, char **argv)
+{
+    int fd;
+
+    fd = kqueue();
+    if (fd < 0) {
+        perror("kqueue:");
+        exit(1);
+    }
+    exit(0);
+}
+  ], [ac_cv_kqueue_works=yes], [ac_cv_kqueue_works=no]))
+AS_IF([test "x$ac_cv_kqueue_works" = "xyes"],
+  [AC_DEFINE([HAVE_KQUEUE], [1], [Define to 1 if kqueue is supported])], [])
+
+AC_CACHE_CHECK([if event ports works], [ac_cv_evports_works],
+  AC_TRY_RUN([
+#include <stdio.h>
+#include <stdlib.h>
+#include <port.h>
+int
+main(int argc, char **argv)
+{
+    int fd;
+
+    fd = port_create();
+    if (fd < 0) {
+        perror("port_create:");
+        exit(1);
+    }
+    exit(0);
+}
+  ], [ac_cv_evports_works=yes], [ac_cv_evports_works=no]))
+AS_IF([test "x$ac_cv_evports_works" = "xyes"],
+  [AC_DEFINE([HAVE_EVENT_PORTS], [1], [Define to 1 if event ports is supported])], [])
+
+AS_IF([test "x$ac_cv_epoll_works" = "xno" &&
+       test "x$ac_cv_kqueue_works" = "xno" &&
+       test "x$ac_cv_evports_works" = "xno"],
+  [AC_MSG_ERROR([either epoll or kqueue or event ports support is required])], [])
+
+AM_CONDITIONAL([OS_LINUX], [test "x$ac_cv_epoll_works" = "xyes"])
+AM_CONDITIONAL([OS_BSD], [test "x$ac_cv_kqueue_works" = "xyes"])
+AM_CONDITIONAL([OS_SOLARIS], [test "x$ac_cv_evports_works" = "xyes"])
+AM_CONDITIONAL([OS_FREEBSD], [test "$(uname -v | cut -c 1-10)" == "FreeBSD 10"])
 
 # Package options
 AC_MSG_CHECKING([whether to enable debug logs and asserts])
@@ -149,7 +207,8 @@ AC_CONFIG_FILES([Makefile
                  contrib/Makefile
                  src/Makefile
                  src/hashkit/Makefile
-                 src/proto/Makefile])
+                 src/proto/Makefile
+                 src/event/Makefile])
 
 # Generate the "configure" script
 AC_OUTPUT

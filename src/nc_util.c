@@ -22,7 +22,6 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <netdb.h>
-#include <execinfo.h>
 
 #include <sys/time.h>
 #include <sys/types.h>
@@ -33,6 +32,10 @@
 #include <netinet/tcp.h>
 
 #include <nc_core.h>
+
+#ifdef NC_HAVE_BACKTRACE
+# include <execinfo.h>
+#endif
 
 int
 nc_set_blocking(int sd)
@@ -104,6 +107,13 @@ nc_set_linger(int sd, int timeout)
     len = sizeof(linger);
 
     return setsockopt(sd, SOL_SOCKET, SO_LINGER, &linger, len);
+}
+
+int
+nc_set_tcpkeepalive(int sd)
+{
+    int val = 1;
+    return setsockopt(sd, SOL_SOCKET, SO_KEEPALIVE, &val, sizeof(val));
 }
 
 int
@@ -275,6 +285,7 @@ _nc_free(void *ptr, const char *name, int line)
 void
 nc_stacktrace(int skip_count)
 {
+#ifdef NC_HAVE_BACKTRACE
     void *stack[64];
     char **symbols;
     int size, i, j;
@@ -292,6 +303,19 @@ nc_stacktrace(int skip_count)
     }
 
     free(symbols);
+#endif
+}
+
+void
+nc_stacktrace_fd(int fd)
+{
+#ifdef NC_HAVE_BACKTRACE
+    void *stack[64];
+    int size;
+
+    size = backtrace(stack, 64);
+    backtrace_symbols_fd(stack, size, fd);
+#endif
 }
 
 void
@@ -472,8 +496,12 @@ nc_resolve_inet(struct string *name, int port, struct sockinfo *si)
 
     nc_snprintf(service, NC_UINTMAX_MAXLEN, "%d", port);
 
+    /*
+     * getaddrinfo() returns zero on success or one of the error codes listed
+     * in gai_strerror(3) if an error occurs
+     */
     status = getaddrinfo(node, service, &hints, &ai);
-    if (status < 0) {
+    if (status != 0) {
         log_error("address resolution of node '%s' service '%s' failed: %s",
                   node, service, gai_strerror(status));
         return -1;
